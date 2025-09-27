@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
@@ -90,3 +90,20 @@ class RedditClient:
         params.setdefault("depth", 10)
         params.setdefault("limit", 500)
         return self.get(f"/r/{subreddit}/comments/{post_id}", params=params)
+
+    def get_more_children(
+        self, link_fullname: str, children: Iterable[str], **params: Any
+    ) -> List[Dict[str, Any]]:
+        """Fetch additional comment objects referenced by a ``more`` placeholder."""
+
+        children_list = [child for child in children if child]
+        if not children_list:
+            return []
+
+        params.setdefault("link_id", link_fullname)
+        params.setdefault("children", ",".join(children_list))
+        params.setdefault("api_type", "json")
+        params.setdefault("limit_children", "false")
+
+        response = self.get("/api/morechildren", params=params)
+        return response.get("json", {}).get("data", {}).get("things", [])

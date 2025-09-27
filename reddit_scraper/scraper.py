@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional
 
 from .formatter import iter_possible_titles
 from .reddit_client import RedditClient, RedditCredentials
@@ -21,6 +21,9 @@ class ScraperConfig:
     client_secret: str
     user_agent: str
     subreddit: str = DEFAULT_SUBREDDIT
+
+
+MoreFetcher = Callable[[Dict, Optional[str]], List[Dict]]
 
 
 def _find_matching_post(posts: Iterable[Dict], candidate_titles: Iterable[str]) -> Optional[Dict]:
@@ -50,7 +53,9 @@ def _find_matching_posts(posts: Iterable[Dict], candidate_titles: Iterable[str])
     return matches
 
 
-def _flatten_comment(comment: Dict) -> Dict:
+def _flatten_comment(
+    comment: Dict, fetch_more: Optional[MoreFetcher] = None, link_fullname: Optional[str] = None
+) -> Dict:
     data = comment.get("data", {})
     replies = data.get("replies")
     children: List[Dict] = []
@@ -65,20 +70,41 @@ def _flatten_comment(comment: Dict) -> Dict:
         "score": data.get("score"),
         "permalink": data.get("permalink"),
         "parent_id": data.get("parent_id"),
-        "replies": [
-            _flatten_comment(reply)
-            for reply in children
-            if reply.get("kind") == "t1"
-        ],
+        "replies": _process_comment_children(children, fetch_more, link_fullname),
     }
 
 
-def _extract_comments(tree: List[Dict]) -> List[Dict]:
-    comments = []
+def _process_comment_children(
+    children: Iterable[Dict],
+    fetch_more: Optional[MoreFetcher],
+    link_fullname: Optional[str],
+) -> List[Dict]:
+    replies: List[Dict] = []
+    for child in children:
+        kind = child.get("kind")
+        if kind == "t1":
+            replies.append(_flatten_comment(child, fetch_more, link_fullname))
+        elif kind == "more" and fetch_more:
+            fetched = fetch_more(child, link_fullname)
+            if fetched:
+                replies.extend(_extract_comments(fetched, fetch_more, link_fullname))
+    return replies
+
+
+def _extract_comments(
+    tree: List[Dict],
+    fetch_more: Optional[MoreFetcher] = None,
+    link_fullname: Optional[str] = None,
+) -> List[Dict]:
+    comments: List[Dict] = []
     for item in tree:
-        if item.get("kind") != "t1":
-            continue
-        comments.append(_flatten_comment(item))
+        kind = item.get("kind")
+        if kind == "t1":
+            comments.append(_flatten_comment(item, fetch_more, link_fullname))
+        elif kind == "more" and fetch_more:
+            fetched = fetch_more(item, link_fullname)
+            if fetched:
+                comments.extend(_extract_comments(fetched, fetch_more, link_fullname))
     return comments
 
 
@@ -127,6 +153,13 @@ def scrape_discussion_thread(
         submission = submission_children[0].get("data", {})
         comments_tree = comments_listing.get("data", {}).get("children", [])
 
+        link_fullname = submission.get("name") or f"t3_{post_id}"
+
+        def fetch_more_children(more_item: Dict, link_id: Optional[str] = link_fullname) -> List[Dict]:
+            more_data = more_item.get("data", {})
+            child_ids = more_data.get("children", []) or []
+            return client.get_more_children(link_id, child_ids)
+
         fetched_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         payload_threads.append(
             {
@@ -141,7 +174,9 @@ def scrape_discussion_thread(
                     "upvote_ratio": post_data.get("upvote_ratio"),
                     "selftext": submission.get("selftext"),
                 },
-                "comments": _extract_comments(comments_tree),
+                "comments": _extract_comments(
+                    comments_tree, fetch_more=fetch_more_children, link_fullname=link_fullname
+                ),
                 "fetched_at": fetched_at,
             }
         )
