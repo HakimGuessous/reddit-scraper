@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Iterable, List
+from typing import Iterable
 
 
 @dataclass(frozen=True)
@@ -30,15 +30,27 @@ WEEKEND_THREAD = ThreadTitleFormat(
 
 
 def iter_possible_titles(target_date: date) -> Iterable[str]:
-    """Yield likely thread titles around the given date.
+    """Yield expected thread titles for the given date.
 
-    Weekend discussion threads often cover the entire weekend and may use the
-    Friday, Saturday or Sunday date. To increase the chance of finding a match
-    we generate titles for a three day window around the provided date.
+    Weekdays are served by the standard daily discussion thread. On Fridays
+    both a daily and a weekend discussion thread are expected, with the
+    weekend thread also using the Friday date. For Saturday and Sunday the
+    search should only consider the weekend thread that references the Friday
+    starting that weekend.
     """
 
-    templates: List[ThreadTitleFormat] = [DAILY_THREAD, WEEKEND_THREAD]
-    for delta in range(-1, 2):
-        shifted = target_date + timedelta(days=delta)
-        for template in templates:
-            yield template.render(shifted)
+    weekday = target_date.weekday()
+
+    if weekday < 4:  # Monday through Thursday
+        yield DAILY_THREAD.render(target_date)
+        return
+
+    if weekday == 4:  # Friday
+        yield DAILY_THREAD.render(target_date)
+        yield WEEKEND_THREAD.render(target_date)
+        return
+
+    # Saturday or Sunday: look for the weekend thread referencing Friday
+    days_since_friday = weekday - 4
+    friday_date = target_date - timedelta(days=days_since_friday)
+    yield WEEKEND_THREAD.render(friday_date)

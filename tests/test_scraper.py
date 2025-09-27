@@ -28,9 +28,11 @@ from reddit_scraper.scraper import (
     ScraperConfig,
     _extract_comments,
     _find_matching_post,
+    _find_matching_posts,
     _flatten_comment,
     scrape_discussion_thread,
 )
+from reddit_scraper.formatter import iter_possible_titles
 
 
 @pytest.fixture
@@ -58,6 +60,23 @@ def test_find_matching_post_returns_none_when_no_match(sample_posts):
     match = _find_matching_post(sample_posts, candidate_titles)
 
     assert match is None
+
+
+def test_find_matching_posts_returns_all_matches(sample_posts):
+    posts = sample_posts + [
+        {"data": {"title": "Weekend Discussion Thread for the Weekend of April 20, 2024", "id": "ghi"}},
+        {"data": {"title": "Daily Discussion Thread for April 21, 2024", "id": "def"}},
+    ]
+
+    candidate_titles = [
+        "Daily Discussion Thread for April 20, 2024",
+        "Weekend Discussion Thread for the Weekend of April 20, 2024",
+        "Daily Discussion Thread for April 21, 2024",
+    ]
+
+    matches = _find_matching_posts(posts, candidate_titles)
+
+    assert [post["data"]["id"] for post in matches] == ["abc", "ghi", "def"]
 
 
 def test_flatten_comment_recursively_processes_replies():
@@ -203,9 +222,11 @@ def test_scrape_discussion_thread_writes_expected_payload(monkeypatch, tmp_path)
     assert output_path.exists()
 
     payload = json.loads(output_path.read_text())
-    assert payload["thread"]["id"] == "post123"
-    assert payload["thread"]["selftext"] == "Thread body"
-    assert payload["comments"] == [
+    assert len(payload["threads"]) == 1
+    thread_payload = payload["threads"][0]
+    assert thread_payload["thread"]["id"] == "post123"
+    assert thread_payload["thread"]["selftext"] == "Thread body"
+    assert thread_payload["comments"] == [
         {
             "id": "c1",
             "author": "commenter",
@@ -218,6 +239,7 @@ def test_scrape_discussion_thread_writes_expected_payload(monkeypatch, tmp_path)
         }
     ]
     assert "fetched_at" in payload
+    assert "fetched_at" in thread_payload
 
 
 def test_scrape_discussion_thread_raises_when_no_match(monkeypatch, tmp_path):
@@ -236,3 +258,132 @@ def test_scrape_discussion_thread_raises_when_no_match(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError):
         scrape_discussion_thread(config, target_date, tmp_path / "output.json")
+
+
+def test_scrape_discussion_thread_handles_multiple_matches(monkeypatch, tmp_path):
+    class MultiPostClient(FakeRedditClient):
+        def search_subreddit(self, subreddit, query, **params):
+            self.search_calls.append((subreddit, query, params))
+            return {
+                "data": {
+                    "children": [
+                        {
+                            "data": {
+                                "id": "daily1",
+                                "title": "Daily Discussion Thread for April 19, 2024",
+                                "author": "AutoModerator",
+                                "created_utc": 1000,
+                                "permalink": "/r/test/daily1",
+                                "num_comments": 10,
+                                "score": 50,
+                                "upvote_ratio": 0.9,
+                            }
+                        },
+                        {
+                            "data": {
+                                "id": "weekend1",
+                                "title": "Weekend Discussion Thread for the Weekend of April 19, 2024",
+                                "author": "AutoModerator",
+                                "created_utc": 900,
+                                "permalink": "/r/test/weekend1",
+                                "num_comments": 20,
+                                "score": 80,
+                                "upvote_ratio": 0.92,
+                            }
+                        },
+                    ]
+                }
+            }
+
+        def get_post_comments(self, subreddit, post_id, **params):
+            self.comment_calls.append((subreddit, post_id, params))
+            if post_id == "daily1":
+                return [
+                    {"data": {"children": [{"data": {"selftext": "Daily body"}}]}},
+                    {
+                        "data": {
+                            "children": [
+                                {
+                                    "kind": "t1",
+                                    "data": {
+                                        "id": "c_daily",
+                                        "author": "user_daily",
+                                        "created_utc": 1010,
+                                        "body": "Daily comment",
+                                        "score": 5,
+                                        "permalink": "/r/test/comments/daily1/c_daily/",
+                                        "parent_id": "t3_daily1",
+                                        "replies": "",
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                ]
+            if post_id == "weekend1":
+                return [
+                    {"data": {"children": [{"data": {"selftext": "Weekend body"}}]}},
+                    {
+                        "data": {
+                            "children": [
+                                {
+                                    "kind": "t1",
+                                    "data": {
+                                        "id": "c_weekend",
+                                        "author": "user_weekend",
+                                        "created_utc": 1020,
+                                        "body": "Weekend comment",
+                                        "score": 7,
+                                        "permalink": "/r/test/comments/weekend1/c_weekend/",
+                                        "parent_id": "t3_weekend1",
+                                        "replies": "",
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                ]
+            raise AssertionError(f"Unexpected post_id {post_id}")
+
+    monkeypatch.setattr("reddit_scraper.scraper.RedditClient", MultiPostClient)
+
+    config = ScraperConfig(client_id="id", client_secret="secret", user_agent="agent")
+    target_date = date(2024, 4, 19)
+    output_path = tmp_path / "output.json"
+
+    scrape_discussion_thread(config, target_date, output_path)
+
+    payload = json.loads(output_path.read_text())
+    assert len(payload["threads"]) == 2
+    ids = {entry["thread"]["id"] for entry in payload["threads"]}
+    assert ids == {"daily1", "weekend1"}
+
+    daily_entry = next(entry for entry in payload["threads"] if entry["thread"]["id"] == "daily1")
+    weekend_entry = next(entry for entry in payload["threads"] if entry["thread"]["id"] == "weekend1")
+
+    assert daily_entry["thread"]["selftext"] == "Daily body"
+    assert daily_entry["comments"][0]["id"] == "c_daily"
+
+    assert weekend_entry["thread"]["selftext"] == "Weekend body"
+    assert weekend_entry["comments"][0]["id"] == "c_weekend"
+
+
+def test_iter_possible_titles_weekday_only_daily():
+    titles = list(iter_possible_titles(date(2024, 4, 17)))  # Wednesday
+
+    assert titles == ["Daily Discussion Thread for April 17, 2024"]
+
+
+def test_iter_possible_titles_friday_includes_weekend_thread():
+    titles = list(iter_possible_titles(date(2024, 4, 19)))
+
+    assert titles == [
+        "Daily Discussion Thread for April 19, 2024",
+        "Weekend Discussion Thread for the Weekend of April 19, 2024",
+    ]
+
+
+def test_iter_possible_titles_weekend_targets_friday_weekend_thread():
+    titles = list(iter_possible_titles(date(2024, 4, 20)))  # Saturday
+
+    assert titles == ["Weekend Discussion Thread for the Weekend of April 19, 2024"]
