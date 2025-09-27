@@ -91,6 +91,8 @@ class RedditClient:
         params.setdefault("limit", 500)
         return self.get(f"/r/{subreddit}/comments/{post_id}", params=params)
 
+    _MAX_CHILDREN_PER_REQUEST = 100
+
     def get_more_children(
         self, link_fullname: str, children: Iterable[str], **params: Any
     ) -> List[Dict[str, Any]]:
@@ -100,10 +102,26 @@ class RedditClient:
         if not children_list:
             return []
 
-        params.setdefault("link_id", link_fullname)
-        params.setdefault("children", ",".join(children_list))
-        params.setdefault("api_type", "json")
-        params.setdefault("limit_children", "false")
+        base_params: Dict[str, Any] = dict(params)
+        base_params.setdefault("link_id", link_fullname)
+        base_params.setdefault("api_type", "json")
+        base_params.setdefault("limit_children", "false")
 
-        response = self.get("/api/morechildren", params=params)
-        return response.get("json", {}).get("data", {}).get("things", [])
+        things: List[Dict[str, Any]] = []
+        for start in range(0, len(children_list), self._MAX_CHILDREN_PER_REQUEST):
+            chunk = children_list[start : start + self._MAX_CHILDREN_PER_REQUEST]
+            chunk_params = dict(base_params)
+            chunk_params["children"] = ",".join(chunk)
+
+            LOGGER.debug(
+                "Fetching %d additional children for %s (offset %d)",
+                len(chunk),
+                link_fullname,
+                start,
+            )
+
+            response = self.get("/api/morechildren", params=chunk_params)
+            chunk_things = response.get("json", {}).get("data", {}).get("things", [])
+            things.extend(chunk_things)
+
+        return things

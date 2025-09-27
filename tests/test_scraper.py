@@ -3,6 +3,7 @@ import sys
 import types
 from datetime import date
 from pathlib import Path
+from typing import Any, Dict, List
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,7 @@ sys.modules.setdefault("requests", requests_stub)
 
 import pytest
 
+from reddit_scraper.reddit_client import RedditClient, RedditCredentials
 from reddit_scraper.scraper import (
     ScraperConfig,
     _extract_comments,
@@ -194,6 +196,30 @@ def test_extract_comments_fetches_more_children():
             "replies": [],
         }
     ]
+
+
+def test_get_more_children_batches_requests():
+    class CapturingClient(RedditClient):
+        def __init__(self) -> None:
+            super().__init__(
+                RedditCredentials(client_id="id", client_secret="secret", user_agent="ua")
+            )
+            self.calls: List[Dict[str, Any]] = []
+
+        def get(self, path: str, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
+            self.calls.append({"path": path, "params": kwargs.get("params", {})})
+            children = kwargs["params"]["children"].split(",")
+            return {"json": {"data": {"things": [{"name": c} for c in children]}}}
+
+    client = CapturingClient()
+    children = [f"t1_child_{i}" for i in range(205)]
+
+    things = client.get_more_children("t3_post", children)
+
+    assert len(client.calls) == 3
+    sizes = [len(call["params"]["children"].split(",")) for call in client.calls]
+    assert sizes == [100, 100, 5]
+    assert [item["name"] for item in things] == children
 
 
 class FakeRedditClient:
