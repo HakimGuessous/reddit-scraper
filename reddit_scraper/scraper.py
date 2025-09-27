@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
@@ -26,14 +26,28 @@ class ScraperConfig:
 def _find_matching_post(posts: Iterable[Dict], candidate_titles: Iterable[str]) -> Optional[Dict]:
     """Return the first post whose title matches any of the candidates."""
 
+    matches = _find_matching_posts(posts, candidate_titles)
+    return matches[0] if matches else None
+
+
+def _find_matching_posts(posts: Iterable[Dict], candidate_titles: Iterable[str]) -> List[Dict]:
+    """Return all posts whose titles match the candidate titles."""
+
     normalized = {title.casefold(): title for title in candidate_titles}
+    matches: List[Dict] = []
+    seen_titles = set()
     for post in posts:
         title = post.get("data", {}).get("title", "")
-        if title.casefold() in normalized:
+        normalized_title = title.casefold()
+        if normalized_title in normalized and normalized_title not in seen_titles:
             LOGGER.info("Matched thread '%s'", title)
-            return post
-    LOGGER.warning("Failed to match any posts by expected titles")
-    return None
+            matches.append(post)
+            seen_titles.add(normalized_title)
+
+    if not matches:
+        LOGGER.warning("Failed to match any posts by expected titles")
+
+    return matches
 
 
 def _flatten_comment(comment: Dict) -> Dict:
@@ -91,40 +105,50 @@ def scrape_discussion_thread(
         limit=50,
     )
     posts = search_results.get("data", {}).get("children", [])
-    post = _find_matching_post(posts, candidate_titles)
-    if not post:
+    matched_posts = _find_matching_posts(posts, candidate_titles)
+    if not matched_posts:
         raise RuntimeError("Could not find a matching discussion thread")
 
-    post_data = post["data"]
-    post_id = post_data["id"]
-    LOGGER.info("Fetching comments for post %s", post_id)
-    comments_response = client.get_post_comments(config.subreddit, post_id)
-    if not isinstance(comments_response, list) or len(comments_response) < 2:
-        raise RuntimeError("Unexpected comments response format")
+    payload_threads: List[Dict] = []
+    for post in matched_posts:
+        post_data = post["data"]
+        post_id = post_data["id"]
+        LOGGER.info("Fetching comments for post %s", post_id)
+        comments_response = client.get_post_comments(config.subreddit, post_id)
+        if not isinstance(comments_response, list) or len(comments_response) < 2:
+            raise RuntimeError("Unexpected comments response format")
 
-    listing = comments_response[0]
-    comments_listing = comments_response[1]
-    submission_children = listing.get("data", {}).get("children", [])
-    if not submission_children:
-        raise RuntimeError("Submission data missing from comments response")
+        listing = comments_response[0]
+        comments_listing = comments_response[1]
+        submission_children = listing.get("data", {}).get("children", [])
+        if not submission_children:
+            raise RuntimeError("Submission data missing from comments response")
 
-    submission = submission_children[0].get("data", {})
-    comments_tree = comments_listing.get("data", {}).get("children", [])
+        submission = submission_children[0].get("data", {})
+        comments_tree = comments_listing.get("data", {}).get("children", [])
+
+        fetched_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        payload_threads.append(
+            {
+                "thread": {
+                    "id": post_id,
+                    "title": post_data.get("title"),
+                    "author": post_data.get("author"),
+                    "created_utc": post_data.get("created_utc"),
+                    "permalink": post_data.get("permalink"),
+                    "num_comments": post_data.get("num_comments"),
+                    "score": post_data.get("score"),
+                    "upvote_ratio": post_data.get("upvote_ratio"),
+                    "selftext": submission.get("selftext"),
+                },
+                "comments": _extract_comments(comments_tree),
+                "fetched_at": fetched_at,
+            }
+        )
 
     payload = {
-        "thread": {
-            "id": post_id,
-            "title": post_data.get("title"),
-            "author": post_data.get("author"),
-            "created_utc": post_data.get("created_utc"),
-            "permalink": post_data.get("permalink"),
-            "num_comments": post_data.get("num_comments"),
-            "score": post_data.get("score"),
-            "upvote_ratio": post_data.get("upvote_ratio"),
-            "selftext": submission.get("selftext"),
-        },
-        "comments": _extract_comments(comments_tree),
-        "fetched_at": datetime.utcnow().isoformat() + "Z",
+        "threads": payload_threads,
+        "fetched_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
