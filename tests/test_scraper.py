@@ -198,6 +198,42 @@ def test_extract_comments_fetches_more_children():
     ]
 
 
+def test_extract_comments_avoids_refetching_same_more():
+    tree = [
+        {"kind": "more", "data": {"id": "more1", "children": ["c_more"]}}
+    ]
+
+    call_count = 0
+
+    def fetch_more(more_item, link_fullname):
+        nonlocal call_count
+        call_count += 1
+        assert link_fullname == "t3_post"
+        if call_count > 1:
+            pytest.fail("fetch_more should not be called more than once for the same more id")
+        return [
+            {"kind": "more", "data": {"id": "more1", "children": ["c_more"]}},
+            {
+                "kind": "t1",
+                "data": {
+                    "id": "c_more",
+                    "author": "user2",
+                    "created_utc": 2,
+                    "body": "child",
+                    "score": 5,
+                    "permalink": "/permalink2",
+                    "parent_id": "t1_c1",
+                    "replies": "",
+                },
+            },
+        ]
+
+    comments = _extract_comments(tree, fetch_more=fetch_more, link_fullname="t3_post")
+
+    assert call_count == 1
+    assert [comment["id"] for comment in comments] == ["c_more"]
+
+
 def test_get_more_children_batches_requests():
     class CapturingClient(RedditClient):
         def __init__(self) -> None:

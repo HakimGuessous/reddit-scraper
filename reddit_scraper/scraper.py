@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Set
 
 from .formatter import iter_possible_titles
 from .reddit_client import RedditClient, RedditCredentials
@@ -54,7 +54,10 @@ def _find_matching_posts(posts: Iterable[Dict], candidate_titles: Iterable[str])
 
 
 def _flatten_comment(
-    comment: Dict, fetch_more: Optional[MoreFetcher] = None, link_fullname: Optional[str] = None
+    comment: Dict,
+    fetch_more: Optional[MoreFetcher] = None,
+    link_fullname: Optional[str] = None,
+    seen_more_ids: Optional[Set[str]] = None,
 ) -> Dict:
     data = comment.get("data", {})
     replies = data.get("replies")
@@ -70,7 +73,9 @@ def _flatten_comment(
         "score": data.get("score"),
         "permalink": data.get("permalink"),
         "parent_id": data.get("parent_id"),
-        "replies": _process_comment_children(children, fetch_more, link_fullname),
+        "replies": _process_comment_children(
+            children, fetch_more, link_fullname, seen_more_ids=seen_more_ids
+        ),
     }
 
 
@@ -78,16 +83,39 @@ def _process_comment_children(
     children: Iterable[Dict],
     fetch_more: Optional[MoreFetcher],
     link_fullname: Optional[str],
+    *,
+    seen_more_ids: Optional[Set[str]] = None,
 ) -> List[Dict]:
+    if seen_more_ids is None:
+        seen_more_ids = set()
     replies: List[Dict] = []
     for child in children:
         kind = child.get("kind")
         if kind == "t1":
-            replies.append(_flatten_comment(child, fetch_more, link_fullname))
+            replies.append(
+                _flatten_comment(
+                    child,
+                    fetch_more,
+                    link_fullname,
+                    seen_more_ids=seen_more_ids,
+                )
+            )
         elif kind == "more" and fetch_more:
+            more_id = child.get("data", {}).get("id")
+            if more_id and more_id in seen_more_ids:
+                continue
+            if more_id:
+                seen_more_ids.add(more_id)
             fetched = fetch_more(child, link_fullname)
             if fetched:
-                replies.extend(_extract_comments(fetched, fetch_more, link_fullname))
+                replies.extend(
+                    _extract_comments(
+                        fetched,
+                        fetch_more,
+                        link_fullname,
+                        seen_more_ids=seen_more_ids,
+                    )
+                )
     return replies
 
 
@@ -95,16 +123,39 @@ def _extract_comments(
     tree: List[Dict],
     fetch_more: Optional[MoreFetcher] = None,
     link_fullname: Optional[str] = None,
+    *,
+    seen_more_ids: Optional[Set[str]] = None,
 ) -> List[Dict]:
+    if seen_more_ids is None:
+        seen_more_ids = set()
     comments: List[Dict] = []
     for item in tree:
         kind = item.get("kind")
         if kind == "t1":
-            comments.append(_flatten_comment(item, fetch_more, link_fullname))
+            comments.append(
+                _flatten_comment(
+                    item,
+                    fetch_more,
+                    link_fullname,
+                    seen_more_ids=seen_more_ids,
+                )
+            )
         elif kind == "more" and fetch_more:
+            more_id = item.get("data", {}).get("id")
+            if more_id and more_id in seen_more_ids:
+                continue
+            if more_id:
+                seen_more_ids.add(more_id)
             fetched = fetch_more(item, link_fullname)
             if fetched:
-                comments.extend(_extract_comments(fetched, fetch_more, link_fullname))
+                comments.extend(
+                    _extract_comments(
+                        fetched,
+                        fetch_more,
+                        link_fullname,
+                        seen_more_ids=seen_more_ids,
+                    )
+                )
     return comments
 
 
