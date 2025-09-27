@@ -143,10 +143,64 @@ def test_extract_comments_filters_non_comment_objects():
     assert comments[0]["id"] == "c1"
 
 
+def test_extract_comments_fetches_more_children():
+    more_node = {"kind": "more", "data": {"children": ["c_more"]}}
+    tree = [
+        {
+            "kind": "t1",
+            "data": {
+                "id": "c1",
+                "author": "user1",
+                "created_utc": 1,
+                "body": "parent",
+                "score": 10,
+                "permalink": "/permalink1",
+                "parent_id": "t3_post",
+                "replies": {"data": {"children": [more_node]}},
+            },
+        }
+    ]
+
+    def fetch_more(more_item, link_fullname):
+        assert link_fullname == "t3_post"
+        assert more_item["data"]["children"] == ["c_more"]
+        return [
+            {
+                "kind": "t1",
+                "data": {
+                    "id": "c_more",
+                    "author": "user2",
+                    "created_utc": 2,
+                    "body": "child",
+                    "score": 5,
+                    "permalink": "/permalink2",
+                    "parent_id": "t1_c1",
+                    "replies": "",
+                },
+            }
+        ]
+
+    comments = _extract_comments(tree, fetch_more=fetch_more, link_fullname="t3_post")
+
+    assert comments[0]["replies"] == [
+        {
+            "id": "c_more",
+            "author": "user2",
+            "created_utc": 2,
+            "body": "child",
+            "score": 5,
+            "permalink": "/permalink2",
+            "parent_id": "t1_c1",
+            "replies": [],
+        }
+    ]
+
+
 class FakeRedditClient:
     def __init__(self, _creds):
         self.search_calls = []
         self.comment_calls = []
+        self.more_calls = []
 
     def search_subreddit(self, subreddit, query, **params):
         self.search_calls.append((subreddit, query, params))
@@ -203,6 +257,10 @@ class FakeRedditClient:
                 }
             },
         ]
+
+    def get_more_children(self, link_fullname, children, **params):
+        self.more_calls.append((link_fullname, tuple(children), params))
+        return []
 
 
 def test_scrape_discussion_thread_writes_expected_payload(monkeypatch, tmp_path):
@@ -366,6 +424,80 @@ def test_scrape_discussion_thread_handles_multiple_matches(monkeypatch, tmp_path
 
     assert weekend_entry["thread"]["selftext"] == "Weekend body"
     assert weekend_entry["comments"][0]["id"] == "c_weekend"
+
+
+def test_scrape_discussion_thread_fetches_more_comments(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "reddit_scraper.scraper.iter_possible_titles",
+        lambda target_date: ["Daily Discussion Thread for April 20, 2024"],
+    )
+
+    class MoreClient(FakeRedditClient):
+        def get_post_comments(self, subreddit, post_id, **params):
+            self.comment_calls.append((subreddit, post_id, params))
+            return [
+                {"data": {"children": [{"data": {"selftext": "Body"}}]}},
+                {
+                    "data": {
+                        "children": [
+                            {
+                                "kind": "t1",
+                                "data": {
+                                    "id": "parent",
+                                    "author": "u1",
+                                    "created_utc": 1,
+                                    "body": "Parent",
+                                    "score": 0,
+                                    "permalink": "/r/test/comments/post123/parent/",
+                                    "parent_id": "t3_post123",
+                                    "replies": {
+                                        "data": {
+                                            "children": [
+                                                {
+                                                    "kind": "more",
+                                                    "data": {"children": ["child1"]},
+                                                }
+                                            ]
+                                        }
+                                    },
+                                },
+                            }
+                        ]
+                    }
+                },
+            ]
+
+        def get_more_children(self, link_fullname, children, **params):
+            self.more_calls.append((link_fullname, tuple(children), params))
+            assert link_fullname == "t3_post123"
+            assert tuple(children) == ("child1",)
+            return [
+                {
+                    "kind": "t1",
+                    "data": {
+                        "id": "child1",
+                        "author": "u2",
+                        "created_utc": 2,
+                        "body": "Child",
+                        "score": 1,
+                        "permalink": "/r/test/comments/post123/child1/",
+                        "parent_id": "t1_parent",
+                        "replies": "",
+                    },
+                }
+            ]
+
+    monkeypatch.setattr("reddit_scraper.scraper.RedditClient", MoreClient)
+
+    config = ScraperConfig(client_id="id", client_secret="secret", user_agent="agent")
+    target_date = date(2024, 4, 20)
+    output_path = tmp_path / "output.json"
+
+    scrape_discussion_thread(config, target_date, output_path)
+
+    payload = json.loads(output_path.read_text())
+    comments = payload["threads"][0]["comments"]
+    assert comments[0]["replies"][0]["id"] == "child1"
 
 
 def test_iter_possible_titles_weekday_only_daily():
