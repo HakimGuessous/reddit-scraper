@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from .formatter import iter_possible_titles
 from .reddit_client import RedditClient, RedditCredentials
@@ -23,24 +23,30 @@ class ScraperConfig:
     subreddit: str = DEFAULT_SUBREDDIT
 
 
-MoreFetcher = Callable[[Dict, Optional[str]], List[Dict]]
+def _author_name(entity: Any) -> Optional[str]:
+    if entity is None:
+        return None
+    name = getattr(entity, "name", None)
+    if name is not None:
+        return name
+    return str(entity)
 
 
-def _find_matching_post(posts: Iterable[Dict], candidate_titles: Iterable[str]) -> Optional[Dict]:
+def _find_matching_post(posts: Iterable[Any], candidate_titles: Iterable[str]) -> Optional[Any]:
     """Return the first post whose title matches any of the candidates."""
 
     matches = _find_matching_posts(posts, candidate_titles)
     return matches[0] if matches else None
 
 
-def _find_matching_posts(posts: Iterable[Dict], candidate_titles: Iterable[str]) -> List[Dict]:
+def _find_matching_posts(posts: Iterable[Any], candidate_titles: Iterable[str]) -> List[Any]:
     """Return all posts whose titles match the candidate titles."""
 
     normalized = {title.casefold(): title for title in candidate_titles}
-    matches: List[Dict] = []
+    matches: List[Any] = []
     seen_titles = set()
     for post in posts:
-        title = post.get("data", {}).get("title", "")
+        title = getattr(post, "title", "")
         normalized_title = title.casefold()
         if normalized_title in normalized and normalized_title not in seen_titles:
             LOGGER.info("Matched thread '%s'", title)
@@ -53,58 +59,29 @@ def _find_matching_posts(posts: Iterable[Dict], candidate_titles: Iterable[str])
     return matches
 
 
-def _flatten_comment(
-    comment: Dict, fetch_more: Optional[MoreFetcher] = None, link_fullname: Optional[str] = None
-) -> Dict:
-    data = comment.get("data", {})
-    replies = data.get("replies")
-    children: List[Dict] = []
-    if isinstance(replies, dict):
-        children = replies.get("data", {}).get("children", [])
-
+def _flatten_comment(comment: Any) -> Dict[str, Any]:
+    replies = getattr(comment, "replies", None) or []
     return {
-        "id": data.get("id"),
-        "author": data.get("author"),
-        "created_utc": data.get("created_utc"),
-        "body": data.get("body"),
-        "score": data.get("score"),
-        "permalink": data.get("permalink"),
-        "parent_id": data.get("parent_id"),
-        "replies": _process_comment_children(children, fetch_more, link_fullname),
+        "id": getattr(comment, "id", None),
+        "author": _author_name(getattr(comment, "author", None)),
+        "created_utc": getattr(comment, "created_utc", None),
+        "body": getattr(comment, "body", None),
+        "score": getattr(comment, "score", None),
+        "permalink": getattr(comment, "permalink", None),
+        "parent_id": getattr(comment, "parent_id", None),
+        "replies": _extract_comments(replies),
     }
 
 
-def _process_comment_children(
-    children: Iterable[Dict],
-    fetch_more: Optional[MoreFetcher],
-    link_fullname: Optional[str],
-) -> List[Dict]:
-    replies: List[Dict] = []
-    for child in children:
-        kind = child.get("kind")
-        if kind == "t1":
-            replies.append(_flatten_comment(child, fetch_more, link_fullname))
-        elif kind == "more" and fetch_more:
-            fetched = fetch_more(child, link_fullname)
-            if fetched:
-                replies.extend(_extract_comments(fetched, fetch_more, link_fullname))
-    return replies
+def _is_comment(obj: Any) -> bool:
+    return hasattr(obj, "body") and hasattr(obj, "id")
 
 
-def _extract_comments(
-    tree: List[Dict],
-    fetch_more: Optional[MoreFetcher] = None,
-    link_fullname: Optional[str] = None,
-) -> List[Dict]:
-    comments: List[Dict] = []
+def _extract_comments(tree: Iterable[Any]) -> List[Dict[str, Any]]:
+    comments: List[Dict[str, Any]] = []
     for item in tree:
-        kind = item.get("kind")
-        if kind == "t1":
-            comments.append(_flatten_comment(item, fetch_more, link_fullname))
-        elif kind == "more" and fetch_more:
-            fetched = fetch_more(item, link_fullname)
-            if fetched:
-                comments.extend(_extract_comments(fetched, fetch_more, link_fullname))
+        if _is_comment(item):
+            comments.append(_flatten_comment(item))
     return comments
 
 
@@ -130,53 +107,29 @@ def scrape_discussion_thread(
         sort="new",
         limit=50,
     )
-    posts = search_results.get("data", {}).get("children", [])
-    matched_posts = _find_matching_posts(posts, candidate_titles)
+    matched_posts = _find_matching_posts(search_results, candidate_titles)
     if not matched_posts:
         raise RuntimeError("Could not find a matching discussion thread")
 
-    payload_threads: List[Dict] = []
+    payload_threads: List[Dict[str, Any]] = []
     for post in matched_posts:
-        post_data = post["data"]
-        post_id = post_data["id"]
-        LOGGER.info("Fetching comments for post %s", post_id)
-        comments_response = client.get_post_comments(config.subreddit, post_id)
-        if not isinstance(comments_response, list) or len(comments_response) < 2:
-            raise RuntimeError("Unexpected comments response format")
-
-        listing = comments_response[0]
-        comments_listing = comments_response[1]
-        submission_children = listing.get("data", {}).get("children", [])
-        if not submission_children:
-            raise RuntimeError("Submission data missing from comments response")
-
-        submission = submission_children[0].get("data", {})
-        comments_tree = comments_listing.get("data", {}).get("children", [])
-
-        link_fullname = submission.get("name") or f"t3_{post_id}"
-
-        def fetch_more_children(more_item: Dict, link_id: Optional[str] = link_fullname) -> List[Dict]:
-            more_data = more_item.get("data", {})
-            child_ids = more_data.get("children", []) or []
-            return client.get_more_children(link_id, child_ids)
-
+        LOGGER.info("Fetching comments for post %s", getattr(post, "id", "<unknown>"))
+        submission = client.get_submission(post.id)
         fetched_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         payload_threads.append(
             {
                 "thread": {
-                    "id": post_id,
-                    "title": post_data.get("title"),
-                    "author": post_data.get("author"),
-                    "created_utc": post_data.get("created_utc"),
-                    "permalink": post_data.get("permalink"),
-                    "num_comments": post_data.get("num_comments"),
-                    "score": post_data.get("score"),
-                    "upvote_ratio": post_data.get("upvote_ratio"),
-                    "selftext": submission.get("selftext"),
+                    "id": submission.id,
+                    "title": submission.title,
+                    "author": _author_name(submission.author),
+                    "created_utc": getattr(submission, "created_utc", None),
+                    "permalink": submission.permalink,
+                    "num_comments": getattr(submission, "num_comments", None),
+                    "score": getattr(submission, "score", None),
+                    "upvote_ratio": getattr(submission, "upvote_ratio", None),
+                    "selftext": getattr(submission, "selftext", None),
                 },
-                "comments": _extract_comments(
-                    comments_tree, fetch_more=fetch_more_children, link_fullname=link_fullname
-                ),
+                "comments": _extract_comments(submission.comments),
                 "fetched_at": fetched_at,
             }
         )

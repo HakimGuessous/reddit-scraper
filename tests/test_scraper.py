@@ -1,31 +1,15 @@
 import json
 import sys
-import types
 from datetime import date
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, List, Sequence
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-
-def _raise_unexpected_call(*args, **kwargs):
-    raise AssertionError("requests should not be invoked during unit tests")
-
-
-requests_stub = types.SimpleNamespace(
-    auth=types.SimpleNamespace(HTTPBasicAuth=lambda client_id, client_secret: (client_id, client_secret)),
-    post=_raise_unexpected_call,
-    request=_raise_unexpected_call,
-)
-
-sys.modules.setdefault("requests", requests_stub)
-
-import pytest
-
-from reddit_scraper.reddit_client import RedditClient, RedditCredentials
 from reddit_scraper.scraper import (
     ScraperConfig,
     _extract_comments,
@@ -34,14 +18,86 @@ from reddit_scraper.scraper import (
     _flatten_comment,
     scrape_discussion_thread,
 )
-from reddit_scraper.formatter import iter_possible_titles
+
+
+class StubAuthor:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class StubComment:
+    def __init__(
+        self,
+        comment_id: str,
+        author: str | None,
+        created_utc: float,
+        body: str,
+        score: int,
+        permalink: str,
+        parent_id: str,
+        replies: Sequence["StubComment"] | None = None,
+    ) -> None:
+        self.id = comment_id
+        self.author = StubAuthor(author) if author is not None else None
+        self.created_utc = created_utc
+        self.body = body
+        self.score = score
+        self.permalink = permalink
+        self.parent_id = parent_id
+        self.replies = list(replies or [])
+
+
+class StubSubmission:
+    def __init__(
+        self,
+        submission_id: str,
+        title: str,
+        author: str,
+        created_utc: float,
+        permalink: str,
+        num_comments: int,
+        score: int,
+        upvote_ratio: float,
+        selftext: str,
+        comments: Sequence[StubComment] | None = None,
+    ) -> None:
+        self.id = submission_id
+        self.title = title
+        self.author = StubAuthor(author)
+        self.created_utc = created_utc
+        self.permalink = permalink
+        self.num_comments = num_comments
+        self.score = score
+        self.upvote_ratio = upvote_ratio
+        self.selftext = selftext
+        self.comments = list(comments or [])
 
 
 @pytest.fixture
-def sample_posts():
+def sample_posts() -> List[StubSubmission]:
     return [
-        {"data": {"title": "Random thread"}},
-        {"data": {"title": "Daily Discussion Thread for April 20, 2024", "id": "abc"}},
+        StubSubmission(
+            "ignored",
+            "Random thread",
+            author="User",
+            created_utc=0.0,
+            permalink="/r/test/ignored",
+            num_comments=0,
+            score=0,
+            upvote_ratio=0.0,
+            selftext="",
+        ),
+        StubSubmission(
+            "abc",
+            "Daily Discussion Thread for April 20, 2024",
+            author="AutoModerator",
+            created_utc=1.0,
+            permalink="/r/test/abc",
+            num_comments=10,
+            score=1,
+            upvote_ratio=0.9,
+            selftext="",
+        ),
     ]
 
 
@@ -66,8 +122,28 @@ def test_find_matching_post_returns_none_when_no_match(sample_posts):
 
 def test_find_matching_posts_returns_all_matches(sample_posts):
     posts = sample_posts + [
-        {"data": {"title": "Weekend Discussion Thread for the Weekend of April 20, 2024", "id": "ghi"}},
-        {"data": {"title": "Daily Discussion Thread for April 21, 2024", "id": "def"}},
+        StubSubmission(
+            "ghi",
+            "Weekend Discussion Thread for the Weekend of April 20, 2024",
+            author="AutoModerator",
+            created_utc=2.0,
+            permalink="/r/test/ghi",
+            num_comments=5,
+            score=2,
+            upvote_ratio=0.8,
+            selftext="",
+        ),
+        StubSubmission(
+            "def",
+            "Daily Discussion Thread for April 21, 2024",
+            author="AutoModerator",
+            created_utc=3.0,
+            permalink="/r/test/def",
+            num_comments=7,
+            score=3,
+            upvote_ratio=0.85,
+            selftext="",
+        ),
     ]
 
     candidate_titles = [
@@ -78,42 +154,30 @@ def test_find_matching_posts_returns_all_matches(sample_posts):
 
     matches = _find_matching_posts(posts, candidate_titles)
 
-    assert [post["data"]["id"] for post in matches] == ["abc", "ghi", "def"]
+    assert [post.id for post in matches] == ["abc", "ghi", "def"]
 
 
 def test_flatten_comment_recursively_processes_replies():
-    comment = {
-        "kind": "t1",
-        "data": {
-            "id": "c1",
-            "author": "user1",
-            "created_utc": 1,
-            "body": "parent",
-            "score": 10,
-            "permalink": "/permalink1",
-            "parent_id": "t3_post",
-            "replies": {
-                "data": {
-                    "children": [
-                        {
-                            "kind": "t1",
-                            "data": {
-                                "id": "c2",
-                                "author": "user2",
-                                "created_utc": 2,
-                                "body": "child",
-                                "score": 5,
-                                "permalink": "/permalink2",
-                                "parent_id": "t1_c1",
-                                "replies": ""
-                            },
-                        },
-                        {"kind": "more", "data": {"id": "ignored"}},
-                    ]
-                }
-            },
-        },
-    }
+    child = StubComment(
+        "c2",
+        author="user2",
+        created_utc=2,
+        body="child",
+        score=5,
+        permalink="/permalink2",
+        parent_id="t1_c1",
+        replies=None,
+    )
+    comment = StubComment(
+        "c1",
+        author="user1",
+        created_utc=1,
+        body="parent",
+        score=10,
+        permalink="/permalink1",
+        parent_id="t3_post",
+        replies=[child],
+    )
 
     flattened = _flatten_comment(comment)
 
@@ -135,8 +199,16 @@ def test_flatten_comment_recursively_processes_replies():
 
 def test_extract_comments_filters_non_comment_objects():
     tree = [
-        {"kind": "t1", "data": {"id": "c1", "replies": ""}},
-        {"kind": "more", "data": {"id": "ignored"}},
+        StubComment(
+            "c1",
+            author="user",
+            created_utc=0,
+            body="body",
+            score=0,
+            permalink="/permalink",
+            parent_id="t3_post",
+        ),
+        object(),
     ]
 
     comments = _extract_comments(tree)
@@ -145,148 +217,51 @@ def test_extract_comments_filters_non_comment_objects():
     assert comments[0]["id"] == "c1"
 
 
-def test_extract_comments_fetches_more_children():
-    more_node = {"kind": "more", "data": {"children": ["c_more"]}}
-    tree = [
-        {
-            "kind": "t1",
-            "data": {
-                "id": "c1",
-                "author": "user1",
-                "created_utc": 1,
-                "body": "parent",
-                "score": 10,
-                "permalink": "/permalink1",
-                "parent_id": "t3_post",
-                "replies": {"data": {"children": [more_node]}},
-            },
-        }
-    ]
-
-    def fetch_more(more_item, link_fullname):
-        assert link_fullname == "t3_post"
-        assert more_item["data"]["children"] == ["c_more"]
-        return [
-            {
-                "kind": "t1",
-                "data": {
-                    "id": "c_more",
-                    "author": "user2",
-                    "created_utc": 2,
-                    "body": "child",
-                    "score": 5,
-                    "permalink": "/permalink2",
-                    "parent_id": "t1_c1",
-                    "replies": "",
-                },
-            }
-        ]
-
-    comments = _extract_comments(tree, fetch_more=fetch_more, link_fullname="t3_post")
-
-    assert comments[0]["replies"] == [
-        {
-            "id": "c_more",
-            "author": "user2",
-            "created_utc": 2,
-            "body": "child",
-            "score": 5,
-            "permalink": "/permalink2",
-            "parent_id": "t1_c1",
-            "replies": [],
-        }
-    ]
-
-
-def test_get_more_children_batches_requests():
-    class CapturingClient(RedditClient):
-        def __init__(self) -> None:
-            super().__init__(
-                RedditCredentials(client_id="id", client_secret="secret", user_agent="ua")
-            )
-            self.calls: List[Dict[str, Any]] = []
-
-        def get(self, path: str, **kwargs: Any) -> Dict[str, Any]:  # type: ignore[override]
-            self.calls.append({"path": path, "params": kwargs.get("params", {})})
-            children = kwargs["params"]["children"].split(",")
-            return {"json": {"data": {"things": [{"name": c} for c in children]}}}
-
-    client = CapturingClient()
-    children = [f"t1_child_{i}" for i in range(205)]
-
-    things = client.get_more_children("t3_post", children)
-
-    assert len(client.calls) == 3
-    sizes = [len(call["params"]["children"].split(",")) for call in client.calls]
-    assert sizes == [100, 100, 5]
-    assert [item["name"] for item in things] == children
-
-
 class FakeRedditClient:
-    def __init__(self, _creds):
-        self.search_calls = []
-        self.comment_calls = []
-        self.more_calls = []
+    def __init__(self, _creds: Any) -> None:
+        self.search_calls: List[Any] = []
+        self.get_submission_calls: List[str] = []
 
-    def search_subreddit(self, subreddit, query, **params):
+    def search_subreddit(self, subreddit: str, query: str, **params: Any) -> List[StubSubmission]:
         self.search_calls.append((subreddit, query, params))
-        return {
-            "data": {
-                "children": [
-                    {
-                        "data": {
-                            "id": "post123",
-                            "title": "Daily Discussion Thread for April 20, 2024",
-                            "author": "AutoModerator",
-                            "created_utc": 1000,
-                            "permalink": "/r/test/post123",
-                            "num_comments": 42,
-                            "score": 100,
-                            "upvote_ratio": 0.95,
-                        }
-                    }
-                ]
-            }
-        }
-
-    def get_post_comments(self, subreddit, post_id, **params):
-        self.comment_calls.append((subreddit, post_id, params))
         return [
-            {
-                "data": {
-                    "children": [
-                        {
-                            "data": {
-                                "selftext": "Thread body"
-                            }
-                        }
-                    ]
-                }
-            },
-            {
-                "data": {
-                    "children": [
-                        {
-                            "kind": "t1",
-                            "data": {
-                                "id": "c1",
-                                "author": "commenter",
-                                "created_utc": 1010,
-                                "body": "Comment",
-                                "score": 1,
-                                "permalink": "/r/test/comments/post123/c1/",
-                                "parent_id": "t3_post123",
-                                "replies": "",
-                            },
-                        }
-                    ]
-                }
-            },
+            StubSubmission(
+                "post123",
+                "Daily Discussion Thread for April 20, 2024",
+                author="AutoModerator",
+                created_utc=1000,
+                permalink="/r/test/post123",
+                num_comments=42,
+                score=100,
+                upvote_ratio=0.95,
+                selftext="",
+            )
         ]
 
-    def get_more_children(self, link_fullname, children, **params):
-        self.more_calls.append((link_fullname, tuple(children), params))
-        return []
+    def get_submission(self, submission_id: str) -> StubSubmission:
+        self.get_submission_calls.append(submission_id)
+        return StubSubmission(
+            submission_id,
+            "Daily Discussion Thread for April 20, 2024",
+            author="AutoModerator",
+            created_utc=1000,
+            permalink="/r/test/post123",
+            num_comments=42,
+            score=100,
+            upvote_ratio=0.95,
+            selftext="Thread body",
+            comments=[
+                StubComment(
+                    "c1",
+                    author="commenter",
+                    created_utc=1010,
+                    body="Comment",
+                    score=1,
+                    permalink="/r/test/comments/post123/c1/",
+                    parent_id="t3_post123",
+                )
+            ],
+        )
 
 
 def test_scrape_discussion_thread_writes_expected_payload(monkeypatch, tmp_path):
@@ -328,8 +303,9 @@ def test_scrape_discussion_thread_writes_expected_payload(monkeypatch, tmp_path)
 
 def test_scrape_discussion_thread_raises_when_no_match(monkeypatch, tmp_path):
     class EmptyClient(FakeRedditClient):
-        def search_subreddit(self, subreddit, query, **params):
-            return {"data": {"children": []}}
+        def search_subreddit(self, subreddit: str, query: str, **params: Any) -> List[StubSubmission]:
+            self.search_calls.append((subreddit, query, params))
+            return []
 
     monkeypatch.setattr(
         "reddit_scraper.scraper.iter_possible_titles",
@@ -346,88 +322,82 @@ def test_scrape_discussion_thread_raises_when_no_match(monkeypatch, tmp_path):
 
 def test_scrape_discussion_thread_handles_multiple_matches(monkeypatch, tmp_path):
     class MultiPostClient(FakeRedditClient):
-        def search_subreddit(self, subreddit, query, **params):
+        def search_subreddit(self, subreddit: str, query: str, **params: Any) -> List[StubSubmission]:
             self.search_calls.append((subreddit, query, params))
-            return {
-                "data": {
-                    "children": [
-                        {
-                            "data": {
-                                "id": "daily1",
-                                "title": "Daily Discussion Thread for April 19, 2024",
-                                "author": "AutoModerator",
-                                "created_utc": 1000,
-                                "permalink": "/r/test/daily1",
-                                "num_comments": 10,
-                                "score": 50,
-                                "upvote_ratio": 0.9,
-                            }
-                        },
-                        {
-                            "data": {
-                                "id": "weekend1",
-                                "title": "Weekend Discussion Thread for the Weekend of April 19, 2024",
-                                "author": "AutoModerator",
-                                "created_utc": 900,
-                                "permalink": "/r/test/weekend1",
-                                "num_comments": 20,
-                                "score": 80,
-                                "upvote_ratio": 0.92,
-                            }
-                        },
-                    ]
-                }
-            }
+            return [
+                StubSubmission(
+                    "daily1",
+                    "Daily Discussion Thread for April 19, 2024",
+                    author="AutoModerator",
+                    created_utc=1000,
+                    permalink="/r/test/daily1",
+                    num_comments=10,
+                    score=50,
+                    upvote_ratio=0.9,
+                    selftext="",
+                ),
+                StubSubmission(
+                    "weekend1",
+                    "Weekend Discussion Thread for the Weekend of April 19, 2024",
+                    author="AutoModerator",
+                    created_utc=900,
+                    permalink="/r/test/weekend1",
+                    num_comments=20,
+                    score=80,
+                    upvote_ratio=0.92,
+                    selftext="",
+                ),
+            ]
 
-        def get_post_comments(self, subreddit, post_id, **params):
-            self.comment_calls.append((subreddit, post_id, params))
-            if post_id == "daily1":
-                return [
-                    {"data": {"children": [{"data": {"selftext": "Daily body"}}]}},
-                    {
-                        "data": {
-                            "children": [
-                                {
-                                    "kind": "t1",
-                                    "data": {
-                                        "id": "c_daily",
-                                        "author": "user_daily",
-                                        "created_utc": 1010,
-                                        "body": "Daily comment",
-                                        "score": 5,
-                                        "permalink": "/r/test/comments/daily1/c_daily/",
-                                        "parent_id": "t3_daily1",
-                                        "replies": "",
-                                    },
-                                }
-                            ]
-                        }
-                    },
-                ]
-            if post_id == "weekend1":
-                return [
-                    {"data": {"children": [{"data": {"selftext": "Weekend body"}}]}},
-                    {
-                        "data": {
-                            "children": [
-                                {
-                                    "kind": "t1",
-                                    "data": {
-                                        "id": "c_weekend",
-                                        "author": "user_weekend",
-                                        "created_utc": 1020,
-                                        "body": "Weekend comment",
-                                        "score": 7,
-                                        "permalink": "/r/test/comments/weekend1/c_weekend/",
-                                        "parent_id": "t3_weekend1",
-                                        "replies": "",
-                                    },
-                                }
-                            ]
-                        }
-                    },
-                ]
-            raise AssertionError(f"Unexpected post_id {post_id}")
+        def get_submission(self, submission_id: str) -> StubSubmission:
+            self.get_submission_calls.append(submission_id)
+            if submission_id == "daily1":
+                return StubSubmission(
+                    "daily1",
+                    "Daily Discussion Thread for April 19, 2024",
+                    author="AutoModerator",
+                    created_utc=1000,
+                    permalink="/r/test/daily1",
+                    num_comments=10,
+                    score=50,
+                    upvote_ratio=0.9,
+                    selftext="Daily body",
+                    comments=[
+                        StubComment(
+                            "c_daily",
+                            author="user_daily",
+                            created_utc=1010,
+                            body="Daily comment",
+                            score=5,
+                            permalink="/r/test/comments/daily1/c_daily/",
+                            parent_id="t3_daily1",
+                        )
+                    ],
+                )
+            if submission_id == "weekend1":
+                return StubSubmission(
+                    "weekend1",
+                    "Weekend Discussion Thread for the Weekend of April 19, 2024",
+                    author="AutoModerator",
+                    created_utc=900,
+                    permalink="/r/test/weekend1",
+                    num_comments=20,
+                    score=80,
+                    upvote_ratio=0.92,
+                    selftext="Weekend body",
+                    comments=[
+                        StubComment(
+                            "c_weekend",
+                            author="user_weekend",
+                            created_utc=1020,
+                            body="Weekend comment",
+                            score=7,
+                            permalink="/r/test/comments/weekend1/c_weekend/",
+                            parent_id="t3_weekend1",
+                        )
+                    ],
+                )
+            raise AssertionError(f"Unexpected post_id {submission_id}")
 
     monkeypatch.setattr("reddit_scraper.scraper.RedditClient", MultiPostClient)
 
@@ -452,68 +422,50 @@ def test_scrape_discussion_thread_handles_multiple_matches(monkeypatch, tmp_path
     assert weekend_entry["comments"][0]["id"] == "c_weekend"
 
 
-def test_scrape_discussion_thread_fetches_more_comments(monkeypatch, tmp_path):
+def test_scrape_discussion_thread_handles_nested_replies(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "reddit_scraper.scraper.iter_possible_titles",
         lambda target_date: ["Daily Discussion Thread for April 20, 2024"],
     )
 
-    class MoreClient(FakeRedditClient):
-        def get_post_comments(self, subreddit, post_id, **params):
-            self.comment_calls.append((subreddit, post_id, params))
-            return [
-                {"data": {"children": [{"data": {"selftext": "Body"}}]}},
-                {
-                    "data": {
-                        "children": [
-                            {
-                                "kind": "t1",
-                                "data": {
-                                    "id": "parent",
-                                    "author": "u1",
-                                    "created_utc": 1,
-                                    "body": "Parent",
-                                    "score": 0,
-                                    "permalink": "/r/test/comments/post123/parent/",
-                                    "parent_id": "t3_post123",
-                                    "replies": {
-                                        "data": {
-                                            "children": [
-                                                {
-                                                    "kind": "more",
-                                                    "data": {"children": ["child1"]},
-                                                }
-                                            ]
-                                        }
-                                    },
-                                },
-                            }
-                        ]
-                    }
-                },
-            ]
+    class NestedClient(FakeRedditClient):
+        def get_submission(self, submission_id: str) -> StubSubmission:
+            self.get_submission_calls.append(submission_id)
+            return StubSubmission(
+                submission_id,
+                "Daily Discussion Thread for April 20, 2024",
+                author="AutoModerator",
+                created_utc=1000,
+                permalink="/r/test/post123",
+                num_comments=1,
+                score=10,
+                upvote_ratio=0.9,
+                selftext="Body",
+                comments=[
+                    StubComment(
+                        "parent",
+                        author="u1",
+                        created_utc=1,
+                        body="Parent",
+                        score=0,
+                        permalink="/r/test/comments/post123/parent/",
+                        parent_id="t3_post123",
+                        replies=[
+                            StubComment(
+                                "child1",
+                                author="u2",
+                                created_utc=2,
+                                body="Child",
+                                score=1,
+                                permalink="/r/test/comments/post123/child1/",
+                                parent_id="t1_parent",
+                            )
+                        ],
+                    )
+                ],
+            )
 
-        def get_more_children(self, link_fullname, children, **params):
-            self.more_calls.append((link_fullname, tuple(children), params))
-            assert link_fullname == "t3_post123"
-            assert tuple(children) == ("child1",)
-            return [
-                {
-                    "kind": "t1",
-                    "data": {
-                        "id": "child1",
-                        "author": "u2",
-                        "created_utc": 2,
-                        "body": "Child",
-                        "score": 1,
-                        "permalink": "/r/test/comments/post123/child1/",
-                        "parent_id": "t1_parent",
-                        "replies": "",
-                    },
-                }
-            ]
-
-    monkeypatch.setattr("reddit_scraper.scraper.RedditClient", MoreClient)
+    monkeypatch.setattr("reddit_scraper.scraper.RedditClient", NestedClient)
 
     config = ScraperConfig(client_id="id", client_secret="secret", user_agent="agent")
     target_date = date(2024, 4, 20)
@@ -524,6 +476,9 @@ def test_scrape_discussion_thread_fetches_more_comments(monkeypatch, tmp_path):
     payload = json.loads(output_path.read_text())
     comments = payload["threads"][0]["comments"]
     assert comments[0]["replies"][0]["id"] == "child1"
+
+
+from reddit_scraper.formatter import iter_possible_titles
 
 
 def test_iter_possible_titles_weekday_only_daily():

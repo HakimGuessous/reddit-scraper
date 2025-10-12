@@ -4,6 +4,7 @@ This project downloads the r/wallstreetbets daily (and weekend) discussion threa
 
 ## Features
 
+* Built on top of [PRAW](https://praw.readthedocs.io/) for resilient access to the official Reddit API.
 * Script-only OAuth flow using your Reddit application credentials.
 * Automatically searches for daily and weekend discussion thread titles matching the supplied date.
 * Recursively fetches the full comment tree and stores it alongside metadata such as scores, authors and timestamps.

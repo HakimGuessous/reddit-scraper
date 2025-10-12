@@ -1,12 +1,12 @@
-"""Simple Reddit API client for authenticated requests."""
+"""Reddit client built on top of PRAW."""
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
-import requests
+import praw
+from prawcore import PrawcoreException
 
 LOGGER = logging.getLogger(__name__)
 
@@ -25,103 +25,63 @@ class RedditCredentials:
 
 
 class RedditClient:
-    """Thin wrapper around the Reddit REST API."""
+    """Wrapper around :mod:`praw` for scraping subreddit content."""
 
-    _TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
-    _BASE_URL = "https://oauth.reddit.com"
-
-    def __init__(self, credentials: RedditCredentials) -> None:
+    def __init__(self, credentials: RedditCredentials, reddit: Optional[praw.Reddit] = None) -> None:
         self._creds = credentials
-        self._access_token: Optional[str] = None
-        self._token_expiry: float = 0.0
-
-    def _authenticate(self) -> None:
-        """Fetches a new access token if the current one is missing or expired."""
-
-        if self._access_token and time.time() < self._token_expiry:
-            return
-
-        LOGGER.debug("Requesting new Reddit access token")
-        auth = requests.auth.HTTPBasicAuth(self._creds.client_id, self._creds.client_secret)
-        data = {"grant_type": "client_credentials"}
-        headers = {"User-Agent": self._creds.user_agent}
-
-        response = requests.post(self._TOKEN_URL, auth=auth, data=data, headers=headers, timeout=30)
-        if response.status_code != 200:
-            raise RedditAPIError(
-                f"Failed to authenticate with Reddit API: {response.status_code} {response.text}"
+        try:
+            self._reddit = reddit or praw.Reddit(
+                client_id=credentials.client_id,
+                client_secret=credentials.client_secret,
+                user_agent=credentials.user_agent,
+                check_for_async=False,
             )
+        except Exception as exc:  # pragma: no cover - defensive wrapper
+            raise RedditAPIError("Failed to initialise Reddit client") from exc
 
-        token_data = response.json()
-        self._access_token = token_data["access_token"]
-        self._token_expiry = time.time() + float(token_data.get("expires_in", 3600)) - 60  # safety margin
-        LOGGER.debug("Obtained new Reddit access token expiring at %s", self._token_expiry)
+    def search_subreddit(self, subreddit: str, query: str, **params: Any) -> List[praw.models.Submission]:
+        """Search for submissions within a subreddit.
 
-    def request(self, method: str, path: str, **kwargs: Any) -> Dict[str, Any]:
-        """Performs an authenticated request against the Reddit API."""
+        Parameters mirror :meth:`praw.models.Subreddit.search` with sensible defaults.
+        """
 
-        self._authenticate()
-        headers = kwargs.pop("headers", {})
-        headers.setdefault("Authorization", f"bearer {self._access_token}")
-        headers.setdefault("User-Agent", self._creds.user_agent)
+        search_params: Dict[str, Any] = dict(params)
+        limit = int(search_params.pop("limit", 25))
+        sort = search_params.pop("sort", "new")
+        time_filter = search_params.pop("time_filter", "all")
+        syntax = search_params.pop("syntax", None)
+        search_params.setdefault("restrict_sr", True)
 
-        url = f"{self._BASE_URL}{path}"
-        LOGGER.debug("Sending %s request to %s", method, url)
-        response = requests.request(method, url, headers=headers, timeout=30, **kwargs)
-        if response.status_code >= 400:
-            raise RedditAPIError(
-                f"Reddit API request failed: {response.status_code} {response.text}"
-            )
-        return response.json()
-
-    def get(self, path: str, **kwargs: Any) -> Dict[str, Any]:
-        return self.request("GET", path, **kwargs)
-
-    def search_subreddit(self, subreddit: str, query: str, **params: Any) -> Dict[str, Any]:
-        """Performs a search request within a subreddit."""
-
-        params.setdefault("q", query)
-        params.setdefault("restrict_sr", "true")
-        params.setdefault("sort", "new")
-        params.setdefault("limit", 25)
-        return self.get(f"/r/{subreddit}/search", params=params)
-
-    def get_post_comments(self, subreddit: str, post_id: str, **params: Any) -> Dict[str, Any]:
-        params.setdefault("depth", 10)
-        params.setdefault("limit", 500)
-        return self.get(f"/r/{subreddit}/comments/{post_id}", params=params)
-
-    _MAX_CHILDREN_PER_REQUEST = 100
-
-    def get_more_children(
-        self, link_fullname: str, children: Iterable[str], **params: Any
-    ) -> List[Dict[str, Any]]:
-        """Fetch additional comment objects referenced by a ``more`` placeholder."""
-
-        children_list = [child for child in children if child]
-        if not children_list:
-            return []
-
-        base_params: Dict[str, Any] = dict(params)
-        base_params.setdefault("link_id", link_fullname)
-        base_params.setdefault("api_type", "json")
-        base_params.setdefault("limit_children", "false")
-
-        things: List[Dict[str, Any]] = []
-        for start in range(0, len(children_list), self._MAX_CHILDREN_PER_REQUEST):
-            chunk = children_list[start : start + self._MAX_CHILDREN_PER_REQUEST]
-            chunk_params = dict(base_params)
-            chunk_params["children"] = ",".join(chunk)
-
+        try:
+            subreddit_ref = self._reddit.subreddit(subreddit)
             LOGGER.debug(
-                "Fetching %d additional children for %s (offset %d)",
-                len(chunk),
-                link_fullname,
-                start,
+                "Searching subreddit %s with query %s (sort=%s, limit=%d)",
+                subreddit,
+                query,
+                sort,
+                limit,
             )
+            submissions = subreddit_ref.search(
+                query=query,
+                sort=sort,
+                syntax=syntax,
+                time_filter=time_filter,
+                limit=limit,
+                params=search_params or None,
+            )
+            return list(submissions)
+        except PrawcoreException as exc:
+            raise RedditAPIError(f"Reddit search failed: {exc}") from exc
 
-            response = self.get("/api/morechildren", params=chunk_params)
-            chunk_things = response.get("json", {}).get("data", {}).get("things", [])
-            things.extend(chunk_things)
+    def get_submission(self, submission_id: str) -> praw.models.Submission:
+        """Return a submission with its full comment tree loaded."""
 
-        return things
+        try:
+            submission = self._reddit.submission(id=submission_id)
+            LOGGER.debug("Fetching submission %s", submission_id)
+            submission.load()
+            submission.comments.replace_more(limit=None)
+            return submission
+        except PrawcoreException as exc:
+            raise RedditAPIError(f"Failed to fetch submission {submission_id}: {exc}") from exc
+
