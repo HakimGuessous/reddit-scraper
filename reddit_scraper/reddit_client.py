@@ -79,7 +79,10 @@ class RedditClient:
         try:
             submission = self._reddit.submission(id=submission_id)
             LOGGER.debug("Fetching submission %s", submission_id)
-            submission.load()
+            # ``Submission`` objects lazily load their data when accessed, so
+            # calling ``load`` is unnecessary and, with newer versions of PRAW,
+            # raises ``AttributeError``. Access the comment tree directly and
+            # ensure it is fully expanded instead.
             submission.comments.replace_more(limit=None)
             return submission
         except PrawcoreException as exc:
